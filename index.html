@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Audio sweep test</title>
+<style>
+  :root { --bg:#fbfaf7; --fg:#1d1d1b; --mut:#6b6a66; --line:#d9d7d0; --acc:#2a6fb0; --ok:#2e7d4f; --bad:#b3402a; --card:#ffffff; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#1b1b1a; --fg:#ecebe6; --mut:#a3a29c; --line:#3a3a37; --acc:#6aa9e0; --ok:#6cc08b; --bad:#e58a73; --card:#242422; } }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:20px 16px 48px; background:var(--bg); color:var(--fg); font:16px/1.5 -apple-system, system-ui, "Segoe UI", sans-serif; max-width:640px; margin-inline:auto; }
+  h1 { font-size:22px; font-weight:600; margin:0 0 4px; }
+  p { margin:8px 0; } .mut { color:var(--mut); font-size:14px; }
+  button { font:inherit; font-weight:500; padding:12px 16px; border-radius:10px; border:1px solid var(--line); background:var(--card); color:var(--fg); width:100%; margin-top:10px; }
+  button.primary { background:var(--acc); border-color:var(--acc); color:#fff; }
+  button:disabled { opacity:.5; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px; margin-top:16px; }
+  #status { font-weight:500; min-height:24px; }
+  table { width:100%; border-collapse:collapse; font-size:14px; } td { padding:5px 0; border-bottom:1px solid var(--line); vertical-align:top; } td:last-child { text-align:right; font-variant-numeric:tabular-nums; }
+  tr:last-child td { border-bottom:0; } .ok { color:var(--ok); } .bad { color:var(--bad); }
+  canvas { width:100%; height:200px; display:block; margin-top:8px; }
+  textarea { width:100%; height:150px; font:12px/1.4 ui-monospace, Menlo, monospace; background:var(--bg); color:var(--fg); border:1px solid var(--line); border-radius:8px; padding:8px; }
+  ol { padding-left:20px; margin:8px 0; }
+</style>
+</head>
+<body>
+<h1>Audio sweep test</h1>
+<p class="mut">Plays a test signal through the speaker and records it with the microphone at the same time, then reports how clean the recording is. Nothing is uploaded; everything stays in this page.</p>
+
+<div class="card">
+  <ol>
+    <li>Set the volume to maximum and put the phone flat on a table, in a quiet room.</li>
+    <li>Tap a test button and allow the microphone (and motion sensors if asked).</li>
+    <li>Listen: does the sound come from the main speaker or from the earpiece?</li>
+  </ol>
+  <button class="primary" id="btnA">Test A: raw microphone</button>
+  <button id="btnB">Test B: with echo cancellation</button>
+  <p id="status" class="mut">Ready.</p>
+</div>
+
+<div class="card" id="resCard" hidden>
+  <table id="resTable"></table>
+  <canvas id="plot" width="1200" height="400"></canvas>
+  <p class="mut">Recorded level along the sweep (200 Hz to 8 kHz), then the high chirp (11 to 20 kHz). The dashed line is the background noise.</p>
+  <button id="btnWav">Download recording (WAV)</button>
+  <button id="btnCopy">Copy results as text</button>
+  <textarea id="resText" readonly></textarea>
+</div>
+
+<script>
+"use strict";
+// ---------- signal design ----------
+const SIG = { lead: 1.0, f1: 200, f2: 8000, T: 3.0, gap: 0.5, hf1: 11000, hf2: 20000, hT: 0.5, tail: 1.0, amp: 0.5 };
+function buildSignal(fs) {
+  const n = Math.round((SIG.lead + SIG.T + SIG.gap + SIG.hT + SIG.tail) * fs), x = new Float32Array(n);
+  const L = SIG.T / Math.log(SIG.f2 / SIG.f1), fade = 0.02;
+  let o = Math.round(SIG.lead * fs);
+  for (let i = 0; i < SIG.T * fs; i++) { const t = i / fs; const w = Math.min(1, t / fade, (SIG.T - t) / fade);
+    x[o + i] = SIG.amp * w * Math.sin(2 * Math.PI * SIG.f1 * L * (Math.exp(t / L) - 1)); }
+  o = Math.round((SIG.lead + SIG.T + SIG.gap) * fs); const k = (SIG.hf2 - SIG.hf1) / SIG.hT;
+  for (let i = 0; i < SIG.hT * fs; i++) { const t = i / fs; const w = Math.min(1, t / fade, (SIG.hT - t) / fade);
+    x[o + i] = SIG.amp * w * Math.sin(2 * Math.PI * (SIG.hf1 * t + 0.5 * k * t * t)); }
+  return x;
+}
+// ---------- analysis (pure functions) ----------
+function rmsDb(x, a, b) { a = Math.max(0, a | 0); b = Math.min(x.length, b | 0); if (b <= a) return -200; let s = 0; for (let i = a; i < b; i++) s += x[i] * x[i]; return 10 * Math.log10(s / (b - a) + 1e-20); }
+function analyse(rec, fs) {
+  const fr = Math.round(0.01 * fs), nf = Math.floor(rec.length / fr), env = new Float32Array(nf);
+  for (let i = 0; i < nf; i++) env[i] = rmsDb(rec, i * fr, (i + 1) * fr);
+  // noise floor: median of the quietest second
+  const sorted = Array.from(env).sort((a, b) => a - b); const noise = sorted[Math.floor(nf * 0.15)];
+  // sweep onset: first frame of a run of 20 frames (0.2 s) all 12 dB above the noise
+  let on = -1; for (let i = 0; i + 20 < nf; i++) { let ok = true; for (let j = 0; j < 20; j++) if (env[i + j] < noise + 12) { ok = false; break; } if (ok) { on = i; break; } }
+  let peak = 0, clip = 0; for (let i = 0; i < rec.length; i++) { const a = Math.abs(rec[i]); if (a > peak) peak = a; if (a >= 0.999) clip++; }
+  const out = { fs, noise, peak, clip, found: on >= 0, onset: on >= 0 ? on * fr / fs : null, curve: [], high: [] };
+  if (on < 0) return out;
+  const s0 = on * fr, L = SIG.T / Math.log(SIG.f2 / SIG.f1), N = 30;
+  for (let i = 0; i < N; i++) { const t0 = SIG.T * i / N, t1 = SIG.T * (i + 1) / N; out.curve.push({ f: SIG.f1 * Math.exp((t0 + t1) / 2 / L), db: rmsDb(rec, s0 + t0 * fs, s0 + t1 * fs) }); }
+  const h0 = s0 + (SIG.T + SIG.gap) * fs;
+  for (let i = 0; i < 6; i++) { const t0 = SIG.hT * i / 6, t1 = SIG.hT * (i + 1) / 6; out.high.push({ f: SIG.hf1 + (SIG.hf2 - SIG.hf1) * (t0 + t1) / 2 / SIG.hT, db: rmsDb(rec, h0 + t0 * fs, h0 + t1 * fs) }); }
+  out.sweepDb = rmsDb(rec, s0 + 0.1 * fs, s0 + (SIG.T - 0.1) * fs);
+  out.highDb = rmsDb(rec, h0 + 0.05 * fs, h0 + (SIG.hT - 0.05) * fs);
+  out.gapDb = rmsDb(rec, s0 + (SIG.T + 0.15) * fs, s0 + (SIG.T + SIG.gap - 0.1) * fs);
+  return out;
+}
+function wavBlob(x, fs) { // 32-bit float mono WAV
+  const b = new ArrayBuffer(44 + x.length * 4), v = new DataView(b); const w = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  w(0, "RIFF"); v.setUint32(4, 36 + x.length * 4, true); w(8, "WAVE"); w(12, "fmt "); v.setUint32(16, 16, true); v.setUint16(20, 3, true); v.setUint16(22, 1, true);
+  v.setUint32(24, fs, true); v.setUint32(28, fs * 4, true); v.setUint16(32, 4, true); v.setUint16(34, 32, true); w(36, "data"); v.setUint32(40, x.length * 4, true);
+  for (let i = 0; i < x.length; i++) v.setFloat32(44 + i * 4, x[i], true); return new Blob([b], { type: "audio/wav" });
+}
+// ---------- page logic (browser only) ----------
+if (typeof document !== "undefined") {
+const $ = id => document.getElementById(id); let last = null;
+const setStatus = (t, cls) => { $("status").textContent = t; $("status").className = cls || "mut"; };
+const WORKLET = `class Rec extends AudioWorkletProcessor { process(inputs) { const ch = inputs[0] && inputs[0][0]; if (ch) this.port.postMessage(ch.slice(0)); return true; } } registerProcessor("rec", Rec);`;
+
+async function run(echo) {
+  $("btnA").disabled = $("btnB").disabled = true; $("resCard").hidden = true; const info = { mode: echo ? "B (echo cancellation on)" : "A (raw microphone)", ua: navigator.userAgent };
+  let ctx, stream; const motion = []; let heading = null;
+  const onMotion = e => { const a = e.accelerationIncludingGravity; if (a) motion.push(performance.now()); };
+  const onOrient = e => { if (typeof e.webkitCompassHeading === "number") heading = e.webkitCompassHeading; };
+  try {
+    // motion sensors (optional)
+    try { if (typeof DeviceMotionEvent !== "undefined" && DeviceMotionEvent.requestPermission) { info.motionPermission = await DeviceMotionEvent.requestPermission(); }
+          if (typeof DeviceOrientationEvent !== "undefined" && DeviceOrientationEvent.requestPermission) { await DeviceOrientationEvent.requestPermission(); } } catch (e) { info.motionPermission = "error: " + e.message; }
+    window.addEventListener("devicemotion", onMotion); window.addEventListener("deviceorientation", onOrient);
+    setStatus("Asking for the microphone…");
+    try { if (navigator.audioSession) { navigator.audioSession.type = "play-and-record"; info.audioSession = "play-and-record"; } } catch (e) {}
+    stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: echo, noiseSuppression: echo, autoGainControl: echo, channelCount: 1 }, video: false });
+    const track = stream.getAudioTracks()[0]; info.trackSettings = track.getSettings ? track.getSettings() : {}; info.trackLabel = track.label;
+    const AC = window.AudioContext || window.webkitAudioContext; ctx = new AC({ sampleRate: 48000, latencyHint: "playback" }); await ctx.resume(); const fs = ctx.sampleRate; info.contextRate = fs;
+    const chunks = []; const src = ctx.createMediaStreamSource(stream); const mute = ctx.createGain(); mute.gain.value = 0; mute.connect(ctx.destination);
+    if (ctx.audioWorklet) { await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET], { type: "application/javascript" })));
+      const node = new AudioWorkletNode(ctx, "rec", { numberOfInputs: 1, numberOfOutputs: 1, channelCount: 1 }); node.port.onmessage = e => chunks.push(e.data); src.connect(node); node.connect(mute); info.recorder = "AudioWorklet"; }
+    else { const node = ctx.createScriptProcessor(4096, 1, 1); node.onaudioprocess = e => chunks.push(new Float32Array(e.inputBuffer.getChannelData(0))); src.connect(node); node.connect(mute); info.recorder = "ScriptProcessor"; }
+    const sig = buildSignal(fs), buf = ctx.createBuffer(1, sig.length, fs); buf.copyToChannel(sig, 0);
+    const player = ctx.createBufferSource(); player.buffer = buf; player.connect(ctx.destination);
+    await new Promise(r => setTimeout(r, 400)); const t0 = performance.now(); player.start();
+    setStatus("Playing and recording… keep quiet for " + Math.ceil(sig.length / fs) + " s");
+    await new Promise(r => setTimeout(r, sig.length / fs * 1000 + 600));
+    const n = chunks.reduce((s, c) => s + c.length, 0), rec = new Float32Array(n); let o = 0; for (const c of chunks) { rec.set(c, o); o += c.length; }
+    info.recordedSeconds = n / fs; info.elapsedSeconds = (performance.now() - t0) / 1000;
+    if (motion.length > 5) info.motionRate = (motion.length - 1) / ((motion[motion.length - 1] - motion[0]) / 1000); info.motionEvents = motion.length; info.compassHeading = heading;
+    last = { rec, fs, info, res: analyse(rec, fs) }; show(last); setStatus("Done.", "ok");
+  } catch (e) { setStatus("Failed: " + (e && e.message ? e.message : e), "bad"); }
+  finally { window.removeEventListener("devicemotion", onMotion); window.removeEventListener("deviceorientation", onOrient);
+    if (stream) stream.getTracks().forEach(t => t.stop()); if (ctx) ctx.close(); $("btnA").disabled = $("btnB").disabled = false; }
+}
+function show({ rec, fs, info, res }) {
+  const f1 = v => (v == null || !isFinite(v)) ? "n/a" : v.toFixed(1), rows = [];
+  rows.push(["Mode", info.mode]); rows.push(["Audio rate", info.contextRate + " Hz"]);
+  const ts = info.trackSettings || {}; rows.push(["Microphone settings", "rate " + (ts.sampleRate || "?") + ", echo " + ts.echoCancellation + ", noise " + ts.noiseSuppression + ", gain " + ts.autoGainControl]);
+  rows.push(["Recorded", f1(info.recordedSeconds) + " s (" + info.recorder + ")"]);
+  rows.push(["Sweep found", res.found ? "yes, at " + f1(res.onset) + " s" : "no", res.found ? "ok" : "bad"]);
+  if (res.found) {
+    const snr = res.sweepDb - res.noise, hi = res.highDb - res.noise;
+    rows.push(["Sweep level above noise", f1(snr) + " dB", snr > 30 ? "ok" : "bad"]);
+    rows.push(["High chirp (11–20 kHz) above noise", f1(hi) + " dB", hi > 15 ? "ok" : "bad"]);
+    rows.push(["Level in the silent gap above noise", f1(res.gapDb - res.noise) + " dB"]);
+  }
+  rows.push(["Peak level", f1(20 * Math.log10(res.peak + 1e-9)) + " dBFS", res.clip > 10 ? "bad" : "ok"]); rows.push(["Clipped samples", String(res.clip), res.clip > 10 ? "bad" : "ok"]);
+  rows.push(["Motion sensor", info.motionRate ? f1(info.motionRate) + " Hz" : "not available (" + (info.motionPermission || "no events") + ")"]);
+  rows.push(["Compass heading", info.compassHeading == null ? "not available" : f1(info.compassHeading) + "°"]);
+  $("resTable").innerHTML = rows.map(r => "<tr><td>" + r[0] + "</td><td class='" + (r[2] || "") + "'>" + r[1] + "</td></tr>").join("");
+  const lines = rows.map(r => r[0] + ": " + r[1]);
+  if (res.found) { lines.push("Curve (Hz:dB): " + res.curve.map(p => Math.round(p.f) + ":" + p.db.toFixed(1)).join(" ")); lines.push("High (Hz:dB): " + res.high.map(p => Math.round(p.f) + ":" + p.db.toFixed(1)).join(" ")); lines.push("Noise dB: " + res.noise.toFixed(1)); }
+  lines.push("Browser: " + info.ua); lines.push("Where did the sound come from (main speaker / earpiece)? ...");
+  $("resText").value = lines.join("\n"); $("resCard").hidden = false; draw(res);
+}
+function draw(res) {
+  const c = $("plot"), g = c.getContext("2d"), W = c.width, H = c.height, cs = getComputedStyle(document.documentElement);
+  g.clearRect(0, 0, W, H); if (!res.found) return;
+  const pts = res.curve.concat(res.high), top = Math.max(...pts.map(p => p.db)) + 5, bot = Math.min(res.noise - 5, top - 60);
+  const X = f => 60 + (W - 80) * Math.log(f / 150) / Math.log(22000 / 150), Y = d => 20 + (H - 70) * (top - d) / (top - bot);
+  g.font = "22px sans-serif"; g.fillStyle = cs.getPropertyValue("--mut"); g.strokeStyle = cs.getPropertyValue("--line"); g.lineWidth = 1;
+  for (const f of [200, 500, 1000, 2000, 5000, 10000, 20000]) { g.beginPath(); g.moveTo(X(f), 20); g.lineTo(X(f), H - 50); g.stroke(); g.textAlign = "center"; g.fillText(f >= 1000 ? f / 1000 + "k" : f, X(f), H - 20); }
+  for (let d = Math.ceil(bot / 20) * 20; d <= top; d += 20) { g.beginPath(); g.moveTo(60, Y(d)); g.lineTo(W - 20, Y(d)); g.stroke(); g.textAlign = "right"; g.fillText(d, 52, Y(d) + 7); }
+  g.setLineDash([8, 8]); g.strokeStyle = cs.getPropertyValue("--mut"); g.beginPath(); g.moveTo(60, Y(res.noise)); g.lineTo(W - 20, Y(res.noise)); g.stroke(); g.setLineDash([]);
+  g.strokeStyle = cs.getPropertyValue("--acc"); g.lineWidth = 4;
+  for (const set of [res.curve, res.high]) { g.beginPath(); set.forEach((p, i) => i ? g.lineTo(X(p.f), Y(p.db)) : g.moveTo(X(p.f), Y(p.db))); g.stroke(); }
+}
+$("btnA").onclick = () => run(false); $("btnB").onclick = () => run(true);
+$("btnWav").onclick = () => { if (!last) return; const a = document.createElement("a"); a.href = URL.createObjectURL(wavBlob(last.rec, last.fs)); a.download = "sweep-test.wav"; a.click(); };
+$("btnCopy").onclick = async () => { try { await navigator.clipboard.writeText($("resText").value); setStatus("Results copied.", "ok"); } catch (e) { $("resText").select(); setStatus("Select the text below and copy it."); } };
+}
+if (typeof module !== "undefined") module.exports = { SIG, buildSignal, analyse, wavBlob, rmsDb };
+</script>
+</body>
+</html>
